@@ -1,10 +1,25 @@
-.vscode
+# Build output
+bin/
+dist/
+# Legacy root-level binaries (build now outputs to bin/)
+/auto-gmail
+/gmail-mcp-server
 
-*.exe
-auto-gmail*
+# Claude Code session state
+.claude/
+
+# Test artefacts
+coverage.out
+coverage.html
+
+# Environment / secrets
+.env
 *.env
 
-# files
+# OAuth credentials and token — never commit these
+credentials.json
 token.json
-candidates.md
-tone_personalization.md
+
+# Editor
+.vscode/
+.idea/

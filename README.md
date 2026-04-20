@@ -2,198 +2,251 @@
 
 An MCP server that lets AI agents search Gmail threads, understand your email writing style, and create draft emails.
 
-## 1. Get Google Authentication
+## Prerequisites
 
-### Step 1: Create a Google Cloud Project
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Click "Select a project" dropdown at the top
-3. Click "New Project"
-4. Enter a project name (e.g., "Gmail MCP Server")
-5. Click "Create"
+- Go 1.25+
+- A Google Cloud project with the Gmail API enabled (see [Google Setup](#1-google-setup))
+- Optional: an OpenAI API key for auto-generating a personal writing style guide
 
-### Step 2: Enable Gmail API
-1. In your new project, go to "APIs & Services" → "Library"
-2. Search for "Gmail API"
-3. Click on "Gmail API" and click "Enable"
+## Quick start
 
-### Step 3: Create OAuth2 Credentials
-1. Go to "APIs & Services" → "Credentials"
-2. Click "Create Credentials" → "OAuth Client ID"
-3. If prompted, configure the OAuth consent screen:
-   - Choose "External" user type
-   - Fill in required fields (App name, User support email, Developer email)
-   - Add your email to "Test users" section
-   - Save and continue through all steps
-4. Back in Credentials, click "Create Credentials" → "OAuth Client ID"
-5. Choose "Desktop application" as the application type
-6. Enter a name (e.g., "Gmail MCP Client")
-7. Click "Create"
-8. **Important**: Copy the **Client ID** and **Client Secret** from the confirmation dialog (you'll need these for configuration)
+```bash
+# 1. Build
+make build
 
-### Step 4: Grant OAuth Scopes
-When you first run the server, it will open your browser for authorization. The server requests **only these minimal permissions**:
+# 2. Run (stdio mode — your MCP client manages the process)
+GMAIL_CLIENT_ID=... GMAIL_CLIENT_SECRET=... ./bin/gmail-mcp-server
 
-#### What We Request:
-- ✅ **Gmail Readonly Access** (`gmail.readonly`)
-  - Search and read your email messages
-  - Download email attachments  
-  - View email metadata (subjects, senders, dates)
+# 3. Or as a persistent SSE server on port 8080
+GMAIL_CLIENT_ID=... GMAIL_CLIENT_SECRET=... ./bin/gmail-mcp-server --http
 
-- ✅ **Gmail Compose Access** (`gmail.compose`)
-  - Create email drafts
-  - Update existing drafts
-  - Delete drafts
-  - **Send emails** (permission granted but not used by this server)
+# Show all flags
+./gmail-mcp-server help
+./gmail-mcp-server --help
+```
 
-#### What This Server Actualy Implements:
-- ✅ **Search and read emails** - Full search capabilities
-- ✅ **Extract attachment text** - Safe PDF/DOCX/TXT text extraction
-- ✅ **Create/update drafts** - Smart draft management with thread awareness
-- ❌ **Send emails** - Server doesn't implement sending (though permission is granted)
-- ❌ **Delete emails** - Server doesn't implement deletion
-- ❌ **Modify labels** - Server doesn't implement label management
+On first run a browser window opens for Gmail OAuth. Approve it once — the token is cached locally for subsequent runs.
 
-## 2. Add to MCP Clients
+---
 
-Build the server first: `go build .`
+## 1. Google Setup
 
-You'll want to add this to your agent's configuration file:
+### Create a project and enable the Gmail API
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project (or reuse an existing one)
+3. Go to **APIs & Services → Library**, search for **Gmail API**, click **Enable**
+
+### Create OAuth credentials
+
+1. Go to **APIs & Services → Credentials → Create Credentials → OAuth Client ID**
+2. If prompted, configure the OAuth consent screen:
+   - User type: **External**
+   - Fill in App name, support email, developer email
+   - Add your own email under **Test users**
+3. Application type: **Desktop application**
+4. Click **Create** — copy the **Client ID** and **Client Secret**
+
+### OAuth scopes requested
+
+| Scope | Why |
+|---|---|
+| `gmail.readonly` | Search and read emails, download attachments |
+| `gmail.compose` | Create and update drafts |
+
+The server never sends emails or deletes anything.
+
+---
+
+## 2. Installation
+
+### From source
+
+```bash
+git clone https://github.com/your-org/gmail-mcp-server
+cd gmail-mcp-server
+make build              # produces bin/gmail-mcp-server
+make install            # copies to $GOPATH/bin/gmail-mcp-server
+```
+
+### Pre-built binaries
+
+Download from the [Releases](../../releases) page. Binaries are available for:
+- Linux amd64 / arm64
+- macOS amd64 / arm64
+- Windows amd64
+
+---
+
+## 3. Configuration
+
+### Credentials — two options
+
+**Option A: `credentials.json` file (recommended for local use)**
+
+Download the credentials file directly from Google Cloud Console:
+
+1. Go to **APIs & Services → Credentials**
+2. Click the pencil icon next to your OAuth client → **Download JSON**
+3. Save the file as `credentials.json` in the config directory
+
+The file looks like this:
+```json
+{
+  "installed": {
+    "client_id": "123….apps.googleusercontent.com",
+    "project_id": "my-project",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "client_secret": "GOCSPX-…",
+    "redirect_uris": ["http://localhost"]
+  }
+}
+```
+
+Run `./gmail-mcp-server help` to see the exact config directory path on your machine.
+
+**Option B: environment variables (recommended for MCP client configs / containers)**
+
+| Variable | Description |
+|---|---|
+| `GMAIL_CLIENT_ID` | OAuth client ID (`…apps.googleusercontent.com`) |
+| `GMAIL_CLIENT_SECRET` | OAuth client secret |
+
+Variables can be set in the MCP client config `env` block, exported in your shell, or placed in a `.env` file in the working directory.
+
+Environment variables take precedence over `credentials.json` if both are present.
+
+### Config / data directory
+
+The server stores `token.json` and `personal-email-style-guide.md` here:
+
+| Platform | Primary | Fallback |
+|---|---|---|
+| Linux | `$XDG_CONFIG_HOME/gmail-mcp-server` (`~/.config/gmail-mcp-server`) | — |
+| macOS | `~/.config/gmail-mcp-server` | `~/Library/Application Support/gmail-mcp-server` (used if it already exists) |
+| Windows | `%AppData%\gmail-mcp-server` | — |
+
+Run `./gmail-mcp-server --help` or the `/server-status` prompt to see the exact path on your machine.
+
+---
+
+## 4. MCP Client Setup
+
+### stdio mode (simplest)
+
+The MCP client launches a new server process each time. OAuth can prompt on every restart — use SSE mode to avoid that.
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on Mac,
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
   "mcpServers": {
     "gmail": {
-      "command": "C:/path/to/your/auto-gmail.exe",
+      "command": "/path/to/gmail-mcp-server",
       "env": {
-        "GMAIL_CLIENT_ID": "your_client_id_here.apps.googleusercontent.com",
-        "GMAIL_CLIENT_SECRET": "your_client_secret_here",
-        "OPENAI_API_KEY": "your_openai_api_key_here"
+        "GMAIL_CLIENT_ID": "your_client_id.apps.googleusercontent.com",
+        "GMAIL_CLIENT_SECRET": "your_client_secret"
       }
     }
   }
 }
 ```
 
-### ⚡ **Persistent HTTP Mode (Recommended to Avoid OAuth Popups)**
+**Cursor** (`~/.cursor/mcp.json` on Mac/Linux, `%USERPROFILE%\.cursor\mcp.json` on Windows) — same format.
 
-**Problem**: In stdio mode, Cursor starts a fresh server process each time (and for each tab), causing OAuth popup spam.
+### HTTP/SSE mode (persistent, recommended)
 
-**Solution**: Run the server as a persistent HTTP daemon that authenticates once and stays running.
+Start the server once — OAuth happens at startup, then all clients share the same authenticated process:
 
-#### Quick Start:
 ```bash
-# Build the server
-go build -o gmail-mcp-server
-
-# Start persistent server (OAuth only once!)
+# Default port 8080
 ./gmail-mcp-server --http
 
-# Or with custom port
-./gmail-mcp-server --http 3000
+# Custom port
+./gmail-mcp-server --http --port 3000
 ```
 
-#### What Happens:
-1. ✅ **OAuth popup appears ONCE** when server starts
-2. ✅ **Server runs persistently** on http://localhost:8080  
-3. ✅ **No more OAuth popups** - server stays authenticated
-4. ✅ **Multiple Cursor tabs/windows** can connect to same server
+Then point your client at the SSE endpoint instead of a command:
 
-#### Cursor Configuration (Still Use stdio for now):
 ```json
 {
   "mcpServers": {
     "gmail": {
-      "command": "C:/path/to/your/gmail-mcp-server",
-      "env": {
-        "GMAIL_CLIENT_ID": "your_client_id_here.apps.googleusercontent.com", 
-        "GMAIL_CLIENT_SECRET": "your_client_secret_here",
-        "OPENAI_API_KEY": "your_openai_api_key_here"
-      }
+      "url": "http://localhost:8080/sse"
     }
   }
 }
 ```
 
-The difference: **You start the server manually once** instead of letting Cursor start it fresh each time.
+Endpoints exposed in SSE mode:
+- `GET  /sse`     — persistent SSE stream (clients connect here)
+- `POST /message` — MCP JSON-RPC messages
 
-#### Server Status:
-- Visit http://localhost:8080 to see server status
-- Health check: http://localhost:8080/health
-- View available tools and configuration examples
+---
 
-### Add to Cursor
-- Press `Ctrl+Shift+P` (Windows/Linux) or `Cmd+Shift+P` (Mac)
-- Click the MCP-tab
-- Click '+ Add new global MCP server'
-- Edit config file
+## 5. Tools and Resources
 
-### Add to Claude Desktop
-- Go to File > Settings > Developer > Edit Config
-- Edit Config file
+### Tools
 
-### Manual Configuration Alternative:
-You can edit these config files directly if you know where to find them:
+| Tool | Description |
+|---|---|
+| `search_threads` | Search Gmail with Gmail query syntax + quarter shorthand |
+| `fetch_email_bodies` | Fetch full body content for specific thread IDs |
+| `create_draft` | Create a new draft or overwrite an existing one in a thread |
+| `extract_attachment_by_filename` | Extract plain text from PDF, DOCX, or TXT attachments |
+| `get_personal_email_style_guide` | Return the personal writing style guide |
 
-- **Cursor:** `C:\Users\[User]\.cursor\mcp.json`
-- **Claude Desktop:** `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
+### Quarter shorthand in searches
 
-## 3. MCP Tools and Resources
+`search_threads` expands quarter references before querying Gmail:
 
-**Tools:**
-- `search_threads` - Search Gmail with queries like "from:email@example.com" or "subject:meeting" (includes draft info)
-- `create_draft` - Create email drafts or update existing drafts (AI will request style guide first)
-- `extract_attachment_by_filename` - Safely extract text from PDF, DOCX, and TXT attachments using filename
-- `get_personal_email_style_guide` - Get your email writing style guide (this is a temporary tool, created because most agents do not yet support fetching resources--once agents implement MCP resources better, then thsi tool can be removed)
+| You write | Gmail receives |
+|---|---|
+| `Q1 2026` | `after:2026/01/01 before:2026/04/01` |
+| `Q2 2026` | `after:2026/04/01 before:2026/07/01` |
+| `Q3 2026` | `after:2026/07/01 before:2026/10/01` |
+| `Q4 2025` | `after:2025/10/01 before:2026/01/01` |
 
-**Resources:**
-- `file://personal-email-style-guide` - Your personal email writing style (auto-generated or manual)
+Quarter references combine freely with other Gmail operators:
 
-**Prompts:**
-- `/generate-email-tone` - Analyze your sent emails to create personalized writing style
-- `/server-status` - Show file locations and server status
-
-## 4. Personal Email Style Guide
-
-The server will create a style-guide file based on the last 25 emails you've sent, so that newly drafted emails will hopefully sound like you. Honestly, so far LLM-written emails still don't sound very authentic.
-
-**Manual Generation:**
-- Run `/generate-email-tone` prompt in your MCP client anytime to regenerate
-- The file is saved to your app data directory (see **File Storage Locations** above)
-
-**AI Integration:**
-- AI always calls `get_personal_email_style_guide` tool before writing emails
-- Ensures consistent personal style across all communications
-- Resource also available at `file://personal-email-style-guide`
-
-## 5. Alternative way to Setup Environment Variables
-
-If you want to run this MCP server outside of an agent, you can create a .env file based on the .env.example file and supply the environment variables that way, or export them into your environment prior to running:
-
-```bash
-export GMAIL_CLIENT_ID=your_client_id_here.apps.googleusercontent.com
-export GMAIL_CLIENT_SECRET=your_client_secret_here
-export OPENAI_API_KEY=your_openai_api_key_here
+```
+from:boss@company.com Q1 2026
+has:attachment Q4 2025
+subject:invoice Q2 2026 is:unread
 ```
 
-## 6. File Storage Locations
+### Resources
 
-The server stores authentication and configuration files in standard application directories:
+- `file://personal-email-style-guide` — your personal email writing style (auto-generated or manual)
 
-### File Locations:
-- **Windows**: `C:\Users\[YourUsername]\AppData\Roaming\auto-gmail\`
-- **Mac**: `~/.auto-gmail/`  
-- **Linux**: `~/.auto-gmail/`
+### Prompts
 
-### Important Files:
-- **`token.json`** - OAuth authentication token (auto-generated)
-- **`personal-email-style-guide.md`** - Your email writing style guide (auto-generated or manual)
+- `/server-status` — show config paths and authentication status
 
-### Quick Commands:
-- Use `/server-status` in your MCP client to see exact file paths
-- Delete `token.json` to force re-authentication with updated permissions
+---
 
-## 7. TODOs
+## 6. Personal Email Style Guide
 
-- [x] **Improve OAuth login flow** - ✅ **SOLVED!** Use persistent HTTP mode (`./gmail-mcp-server --http`) to avoid OAuth popups. Server authenticates once and stays running.
-- [ ] **Full HTTP MCP Transport** - Waiting for mark3labs/mcp-go to expose complete HTTP transport APIs
-- [ ] **Better Email Authenticity** - LLM-written emails still don't sound perfectly authentic despite style guides
+Create `personal-email-style-guide.md` in the config directory to give the AI your preferred tone and conventions. The file is returned by the `get_personal_email_style_guide` tool and the `file://personal-email-style-guide` resource before any draft is written.
+
+---
+
+## 7. Development
+
+```bash
+make build           # → bin/gmail-mcp-server
+make install         # → $GOPATH/bin/gmail-mcp-server
+make test            # race detector + coverage profile
+make test-coverage   # test + HTML coverage report
+make test-short      # skip slow/integration tests
+make lint            # golangci-lint
+make fmt             # gofmt + goimports
+make tidy            # go mod tidy + verify
+
+make release-snapshot  # local GoReleaser snapshot (no publish)
+make release           # publish tagged release (requires GITHUB_TOKEN)
+```
+
+Cross-platform releases (Linux, macOS, Windows × amd64/arm64) are produced by [GoReleaser](.goreleaser.yaml).
