@@ -1,0 +1,62 @@
+# AI Rules Configuration
+# This file configures dotai to sync rules from a central repository.
+#
+#   dotai discover   — list available profiles, tools, and skills
+#   dotai sync       — apply rules to your project
+#   dotai check      — detect drift in CI
+#   dotai upgrade    — refresh this file with the latest options
+
+config-version: 2
+
+# Central repository containing shared AI assistant rules
+source: git@gitlab.cee.redhat.com:devtools/ai-rules.git
+
+# Pinned version (git tag or commit hash)
+# Update this to pull new rules, then run 'dotai sync'
+version: v0.11.0
+
+# Role-based profiles to include (run 'dotai discover' to list available)
+profiles:
+  - go
+#   - typescript
+
+# AI tools to generate configuration for
+tools:
+  - claude
+
+# ── Local skills ────────────────────────────────────────────────────────────
+# Skills installed to .claude/skills/ in this project.
+# Run 'dotai discover' to see available skill names.
+# Local overrides: place .ai-rules/skills/<name>/SKILL.md to override
+# a central skill for this project only.
+
+# Remove orphaned local skills no longer in the central repository during sync.
+# prune: false
+
+# Additional external skill repositories to fetch during sync.
+# External skills follow the same global/local routing as central skills.
+# Use a git tag for reproducible builds, or a branch for always-latest.
+# skill-sources:
+#   - url: https://github.com/example/my-skills
+#     version: main
+#   - url: https://github.com/example/shared-skills
+#     path: some-skill          # subdirectory within the repo
+#     version: v1.0.0
+
+# Opt into optional skill sources declared in the central repository.
+# Run 'dotai discover' to see available optional skills and their names.
+# opt-in-skills: []
+
+# ── Global skills ───────────────────────────────────────────────────────────
+# Skills installed to ~/.claude/skills/ are available across all projects.
+# The central repo declares defaults in global-skills.yaml; add names here
+# to extend that list for this repo. Run 'dotai discover' to see what's global.
+
+# global-skills:
+#   - my-skill
+
+# Directory for globally-installed skills. Defaults to ~/.claude/skills.
+# global-skills-dir: ~/.claude/skills
+
+# Remove orphaned global skills no longer in the central repository during sync.
+# prune-global: false
