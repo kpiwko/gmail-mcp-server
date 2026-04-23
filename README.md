@@ -17,7 +17,7 @@ make build
 # 2. Run (stdio mode — your MCP client manages the process)
 GMAIL_CLIENT_ID=... GMAIL_CLIENT_SECRET=... ./bin/gmail-mcp-server
 
-# 3. Or as a persistent SSE server on port 8080
+# 3. Or as a persistent HTTP server on port 6633
 GMAIL_CLIENT_ID=... GMAIL_CLIENT_SECRET=... ./bin/gmail-mcp-server --http
 
 # Show all flags
@@ -59,6 +59,52 @@ The server never sends emails or deletes anything.
 ---
 
 ## 2. Installation
+
+### Container (recommended — no Go toolchain needed)
+
+Build the image once from the project root:
+
+```bash
+podman build -t localhost/gmail-mcp-server .
+```
+
+Create a named volume for the OAuth token (persists across container restarts):
+
+```bash
+podman volume create gmail-mcp-data
+```
+
+Run the server:
+
+```bash
+podman run -d --name gmail-mcp-server \
+  -p 6633:6633 \
+  -v gmail-mcp-data:/config \
+  -e GMAIL_CLIENT_ID=<your-client-id> \
+  -e GMAIL_CLIENT_SECRET=<your-client-secret> \
+  -e XDG_CONFIG_HOME=/config \
+  localhost/gmail-mcp-server
+```
+
+**First run — authorize Gmail access:**
+
+```bash
+open http://localhost:6633/auth
+```
+
+The page shows a Google link and a short verification code. Click the link,
+sign in, enter the code if prompted, and the page updates to show
+"Authorized". The token is saved in the volume — no restart needed.
+
+**Register with Claude Code** (once, after authorizing):
+
+```bash
+claude mcp add --transport http --scope user gmail http://localhost:6633/mcp
+```
+
+**Subsequent runs** just start the container — the cached token is loaded from
+the volume automatically. Visit `/auth` at any time to check status or
+re-authorize if the token ever expires.
 
 ### From source
 
@@ -135,7 +181,7 @@ Run `./gmail-mcp-server --help` or the `/server-status` prompt to see the exact 
 
 ### stdio mode (simplest)
 
-The MCP client launches a new server process each time. OAuth can prompt on every restart — use SSE mode to avoid that.
+The MCP client launches a new server process each time. OAuth can prompt on every restart — use HTTP mode to avoid that.
 
 **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json` on Mac,
 `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
@@ -156,33 +202,32 @@ The MCP client launches a new server process each time. OAuth can prompt on ever
 
 **Cursor** (`~/.cursor/mcp.json` on Mac/Linux, `%USERPROFILE%\.cursor\mcp.json` on Windows) — same format.
 
-### HTTP/SSE mode (persistent, recommended)
+### HTTP mode (persistent, recommended)
 
 Start the server once — OAuth happens at startup, then all clients share the same authenticated process:
 
 ```bash
-# Default port 8080
+# Default port 6633
 ./gmail-mcp-server --http
 
 # Custom port
 ./gmail-mcp-server --http --port 3000
 ```
 
-Then point your client at the SSE endpoint instead of a command:
+Then point your client at the MCP endpoint instead of a command:
 
 ```json
 {
   "mcpServers": {
     "gmail": {
-      "url": "http://localhost:8080/sse"
+      "url": "http://localhost:6633/mcp"
     }
   }
 }
 ```
 
-Endpoints exposed in SSE mode:
-- `GET  /sse`     — persistent SSE stream (clients connect here)
-- `POST /message` — MCP JSON-RPC messages
+Endpoint exposed in HTTP mode:
+- `POST /mcp` — MCP JSON-RPC (streamable HTTP transport)
 
 ---
 

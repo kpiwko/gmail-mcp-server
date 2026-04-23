@@ -12,20 +12,25 @@ import (
 // SearchThreads searches Gmail threads matching query, expanding quarter
 // shorthand (e.g. "Q1 2026") into Gmail date operators before querying.
 func (s *Server) SearchThreads(ctx context.Context, query string, maxResults int64) (*mcp.CallToolResult, error) {
+	svc, err := s.svc()
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	if maxResults <= 0 {
 		maxResults = 10
 	}
 
 	query = parseQuarterQuery(query)
 
-	threads, err := s.service.Users.Threads.List(s.userID).Q(query).MaxResults(maxResults).Do()
+	threads, err := svc.Users.Threads.List(s.userID).Q(query).MaxResults(maxResults).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to search threads: %v", err)), nil
 	}
 
 	results := make([]map[string]interface{}, 0, len(threads.Threads))
 	for _, thread := range threads.Threads {
-		threadDetail, err := s.service.Users.Threads.Get(s.userID, thread.Id).Do()
+		threadDetail, err := svc.Users.Threads.Get(s.userID, thread.Id).Do()
 		if err != nil {
 			continue
 		}

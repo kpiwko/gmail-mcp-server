@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"html/template"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
@@ -11,7 +14,9 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
+	"golang.org/x/oauth2"
 
+	"github.com/kpiwko/gmail-mcp-server/internal/auth"
 	"github.com/kpiwko/gmail-mcp-server/internal/config"
 	"github.com/kpiwko/gmail-mcp-server/internal/gmail"
 )
@@ -34,8 +39,8 @@ var rootCmd = &cobra.Command{
 	Use:     "gmail-mcp-server",
 	Short:   "Expose Gmail as an MCP service for AI agents",
 	Version: Version,
-	Long: `gmail-mcp-server connects your Gmail account to MCP clients (Claude Desktop,
-Cursor, etc.) so AI agents can search threads, read emails, and create drafts.
+	Long: `gmail-mcp-server connects your Gmail account to MCP clients (Claude, Cursor,
+etc.) so AI agents can search threads, read emails, and create drafts.
 
 Credentials (one of):
   credentials.json     OAuth client file downloaded from Google Cloud Console,
@@ -43,39 +48,267 @@ Credentials (one of):
   GMAIL_CLIENT_ID      Google OAuth client ID      }  env vars take
   GMAIL_CLIENT_SECRET  Google OAuth client secret  }  precedence
 
-Run 'gmail-mcp-server --help' to see all flags and modes.`,
+Authorization (first run):
+  Start in HTTP mode and open the /auth page in a browser:
+    gmail-mcp-server --http
+    open http://localhost:8080/auth
+
+  The page walks you through Google Device Authorization — no redirect URI
+  needed, works in containers and headless environments. The token is cached
+  for subsequent runs.
+
+Run 'gmail-mcp-server --help' to see all flags.`,
 	RunE: run,
 }
 
 func init() {
-	rootCmd.PersistentFlags().BoolVar(&useHTTP, "http", false, "Run in HTTP/SSE mode instead of stdio")
-	rootCmd.PersistentFlags().StringVar(&port, "port", "8080", "Port to listen on in HTTP/SSE mode")
+	rootCmd.PersistentFlags().BoolVar(&useHTTP, "http", false, "Run in streamable HTTP mode instead of stdio")
+	rootCmd.PersistentFlags().StringVar(&port, "port", "6633", "Port to listen on in HTTP/SSE mode")
 }
 
 func run(_ *cobra.Command, _ []string) error {
-	// Load .env if present — ignore error, file is optional.
 	if err := godotenv.Load(); err == nil {
 		log.Println("Loaded .env file")
 	}
 
-	log.Printf("📁 Config directory : %s", config.AppDataDir())
-	log.Printf("🔑 Token file       : %s", config.AppFilePath("token.json"))
-	log.Printf("📝 Style guide      : %s", config.AppFilePath("personal-email-style-guide.md"))
+	log.Printf("Config directory: %s", config.AppDataDir())
 
-	gmailServer, err := gmail.NewServer()
+	clientID, clientSecret, err := auth.LoadCredentials()
 	if err != nil {
-		return fmt.Errorf("failed to create Gmail server: %w", err)
+		return fmt.Errorf("loading credentials: %w", err)
 	}
+	cfg := auth.OAuthConfig(clientID, clientSecret)
 
-	mcpServer := buildMCPServer(gmailServer)
+	token, tokenErr := auth.GetCachedToken()
 
 	if useHTTP {
-		return serveHTTP(gmailServer, mcpServer, port)
+		return startHTTP(cfg, token, tokenErr, port)
 	}
-	return serveStdio(mcpServer)
+	return startStdio(cfg, token, tokenErr)
 }
 
-// buildMCPServer wires all tools, resources, and prompts onto a new MCPServer.
+// ── HTTP mode ─────────────────────────────────────────────────────────────────
+
+func startHTTP(cfg *oauth2.Config, token *oauth2.Token, tokenErr error, httpPort string) error {
+	gs := gmail.NewPending()
+	mcpServer := buildMCPServer(gs)
+
+	var df *auth.DeviceFlow
+
+	if tokenErr == nil {
+		if err := gs.Authenticate(token, cfg); err != nil {
+			return fmt.Errorf("initializing gmail service: %w", err)
+		}
+		log.Println("✅ Gmail authentication verified")
+	} else {
+		log.Printf("No token found — starting device authorization flow")
+		log.Printf("Open http://localhost:%s/auth in a browser to authorize", httpPort)
+		var err error
+		df, err = auth.StartDeviceFlow(context.Background(), cfg)
+		if err != nil {
+			return fmt.Errorf("starting device authorization: %w", err)
+		}
+		go func() {
+			<-df.Wait()
+			if df.Err() != nil {
+				return
+			}
+			if err := gs.Authenticate(df.Token(), cfg); err != nil {
+				log.Printf("❌ Failed to initialize Gmail service after auth: %v", err)
+			}
+		}()
+	}
+
+	return serveHTTP(gs, mcpServer, httpPort, df)
+}
+
+func serveHTTP(gs *gmail.Server, mcpServer *server.MCPServer, httpPort string, df *auth.DeviceFlow) error {
+	baseURL := fmt.Sprintf("http://localhost:%s", httpPort)
+	httpServer := server.NewStreamableHTTPServer(mcpServer)
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", httpServer)
+	mux.HandleFunc("/auth/status", makeStatusHandler(gs, df))
+	mux.HandleFunc("/auth", makeAuthPageHandler(df, httpPort))
+
+	log.Printf("✅ Gmail MCP Server listening on %s", baseURL)
+	if df != nil {
+		log.Printf("   Authorize at     : %s/auth", baseURL)
+	} else {
+		log.Printf("   MCP endpoint     : %s/mcp", baseURL)
+	}
+
+	return http.ListenAndServe(":"+httpPort, mux)
+}
+
+// makeAuthPageHandler serves the authorization UI.
+// When df is nil the server was already authenticated at startup.
+func makeAuthPageHandler(df *auth.DeviceFlow, httpPort string) http.HandlerFunc {
+	type pageData struct {
+		Authenticated   bool
+		PendingAuth     bool
+		VerificationURI string
+		UserCode        string
+		Port            string
+		Error           string
+	}
+
+	const authPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Gmail MCP Server — Authorization</title>
+  <style>
+    *{box-sizing:border-box}
+    body{font-family:system-ui,sans-serif;max-width:560px;margin:80px auto;padding:0 20px;color:#202124}
+    h1{font-size:1.4rem;margin-bottom:4px}
+    .sub{color:#5f6368;margin-bottom:32px}
+    .card{border:1px solid #dadce0;border-radius:8px;padding:24px;margin-bottom:16px}
+    .step{color:#5f6368;font-size:.85rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+    .btn{display:inline-block;background:#1a73e8;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-size:15px;font-weight:500}
+    .btn:hover{background:#1557b0}
+    .code{font-size:2rem;font-weight:700;letter-spacing:.15em;font-family:monospace;color:#1a73e8;margin:8px 0}
+    .status{margin-top:16px;padding:14px 18px;border-radius:6px;font-size:.95rem}
+    .waiting{background:#fef7e0;color:#856404}
+    .success{background:#e6f4ea;color:#1e7e34}
+    .error-box{background:#fce8e6;color:#c5221f}
+    pre{background:#f1f3f4;padding:12px 16px;border-radius:4px;overflow-x:auto;font-size:.85rem}
+    .done-info{margin-top:12px}
+  </style>
+</head>
+<body>
+  <h1>Gmail MCP Server</h1>
+  <p class="sub">Authorization</p>
+
+  {{if .Authenticated}}
+  <div class="card">
+    <div class="status success">✅ Gmail is authorized and the MCP server is ready.</div>
+    <div class="done-info">
+      <p>Register with Claude Code (run once):</p>
+      <pre>claude mcp add --transport http --scope user gmail \
+  http://localhost:{{.Port}}/mcp</pre>
+    </div>
+  </div>
+
+  {{else if .Error}}
+  <div class="card">
+    <div class="status error-box">❌ Authorization failed: {{.Error}}</div>
+    <p>Restart the server to try again.</p>
+  </div>
+
+  {{else if .PendingAuth}}
+  <div class="card">
+    <p class="step">Step 1 — open Google's authorization page</p>
+    <a href="{{.VerificationURI}}" target="_blank" rel="noopener" class="btn">Authorize on Google ↗</a>
+  </div>
+  <div class="card">
+    <p class="step">Step 2 — enter this code if prompted</p>
+    <div class="code">{{.UserCode}}</div>
+  </div>
+  <div id="status" class="status waiting">⏳ Waiting for authorization…</div>
+
+  <script>
+    function poll(){
+      fetch('/auth/status')
+        .then(r=>r.json())
+        .then(d=>{
+          var el=document.getElementById('status');
+          if(d.authorized){
+            el.className='status success';
+            el.innerHTML='✅ Authorized! Reloading…';
+            setTimeout(()=>location.reload(),1200);
+          } else if(d.error){
+            el.className='status error-box';
+            el.textContent='❌ '+d.error;
+          } else {
+            setTimeout(poll,2000);
+          }
+        })
+        .catch(()=>setTimeout(poll,2000));
+    }
+    setTimeout(poll,2000);
+  </script>
+
+  {{else}}
+  <div class="card">
+    <div class="status waiting">⏳ Authorization flow not started — restart the server.</div>
+  </div>
+  {{end}}
+</body>
+</html>`
+
+	tmpl := template.Must(template.New("auth").Parse(authPageHTML))
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		data := pageData{Port: httpPort}
+
+		switch {
+		case df == nil:
+			data.Authenticated = true
+		case df.IsComplete() && df.Err() != nil:
+			data.Error = df.Err().Error()
+		case df.IsComplete():
+			data.Authenticated = true
+		default:
+			data.PendingAuth = true
+			data.VerificationURI = df.VerificationURI
+			data.UserCode = df.UserCode
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_ = tmpl.Execute(w, data)
+	}
+}
+
+func makeStatusHandler(gs *gmail.Server, df *auth.DeviceFlow) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		type response struct {
+			Authorized bool   `json:"authorized"`
+			Error      string `json:"error,omitempty"`
+		}
+
+		var resp response
+		switch {
+		case gs.IsAuthenticated():
+			resp.Authorized = true
+		case df != nil && df.IsComplete() && df.Err() != nil:
+			resp.Error = df.Err().Error()
+		}
+
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// ── Stdio mode ────────────────────────────────────────────────────────────────
+
+func startStdio(cfg *oauth2.Config, token *oauth2.Token, tokenErr error) error {
+	if tokenErr != nil {
+		return fmt.Errorf(
+			"no Gmail token found\n\n"+
+				"Run in HTTP mode first to authorize via browser:\n"+
+				"  %s --http\n"+
+				"  open http://localhost:8080/auth\n\n"+
+				"The token is cached and stdio mode will work on the next run.",
+			os.Args[0])
+	}
+
+	gs, err := gmail.New(token, cfg)
+	if err != nil {
+		return fmt.Errorf("initializing gmail service: %w", err)
+	}
+
+	mcpServer := buildMCPServer(gs)
+	log.Println("Starting Gmail MCP Server in stdio mode…")
+	if err := server.ServeStdio(mcpServer); err != nil {
+		return fmt.Errorf("stdio server error: %w", err)
+	}
+	return nil
+}
+
+// ── MCP server construction ───────────────────────────────────────────────────
+
 func buildMCPServer(gs *gmail.Server) *server.MCPServer {
 	mcpServer := server.NewMCPServer(
 		"Gmail MCP Server",
@@ -97,7 +330,7 @@ func buildMCPServer(gs *gmail.Server) *server.MCPServer {
 	return mcpServer
 }
 
-// ── Resources ────────────────────────────────────────────────────────────────
+// ── Resources ─────────────────────────────────────────────────────────────────
 
 func addStyleGuideResource(mcpServer *server.MCPServer) {
 	resource := mcp.NewResource(
@@ -367,39 +600,4 @@ func addExtractAttachmentTool(mcpServer *server.MCPServer, gs *gmail.Server) {
 		}
 		return gs.ExtractAttachmentByFilename(ctx, messageID, filename)
 	})
-}
-
-// ── Server startup ───────────────────────────────────────────────────────────
-
-func serveHTTP(gs *gmail.Server, mcpServer *server.MCPServer, httpPort string) error {
-	log.Printf("Starting Gmail MCP Server in HTTP/SSE mode on port %s...", httpPort)
-
-	// Verify authentication at startup so users see a clear error before any
-	// client connects.
-	if _, err := gs.Profile(); err != nil {
-		return fmt.Errorf("gmail authentication failed: %w", err)
-	}
-	log.Println("✅ Gmail authentication verified")
-
-	baseURL := fmt.Sprintf("http://localhost:%s", httpPort)
-	sseServer := server.NewSSEServer(mcpServer, server.WithBaseURL(baseURL))
-
-	log.Printf("✅ SSE server listening on %s", baseURL)
-	log.Printf("   SSE endpoint     : %s/sse", baseURL)
-	log.Printf("   Message endpoint : %s/message", baseURL)
-	log.Printf(`   MCP client config: { "mcpServers": { "gmail": { "url": "%s/sse" } } }`, baseURL)
-
-	if err := sseServer.Start(":" + httpPort); err != nil {
-		return fmt.Errorf("SSE server error: %w", err)
-	}
-	return nil
-}
-
-func serveStdio(mcpServer *server.MCPServer) error {
-	log.Println("Starting Gmail MCP Server in stdio mode...")
-	log.Println("✅ Server ready — waiting for MCP client connections via stdio")
-	if err := server.ServeStdio(mcpServer); err != nil {
-		return fmt.Errorf("stdio server error: %w", err)
-	}
-	return nil
 }

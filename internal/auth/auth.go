@@ -4,14 +4,10 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"os/exec"
-	"runtime"
-	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -20,8 +16,10 @@ import (
 	"github.com/kpiwko/gmail-mcp-server/internal/config"
 )
 
-// credentialsFile matches the JSON downloaded from Google Cloud Console
-// (APIs & Services → Credentials → Download OAuth client).
+// ErrNoToken is returned when no usable cached token exists.
+var ErrNoToken = errors.New("no cached token — authorization required")
+
+// credentialsFile matches the JSON downloaded from Google Cloud Console.
 type credentialsFile struct {
 	Installed struct {
 		ClientID     string   `json:"client_id"`
@@ -42,35 +40,25 @@ func LoadCredentials() (clientID, clientSecret string, err error) {
 	credPath := config.AppFilePath("credentials.json")
 	data, readErr := os.ReadFile(credPath)
 	if readErr != nil {
-		if !os.IsNotExist(readErr) {
-			return "", "", fmt.Errorf("failed to read %s: %v", credPath, readErr)
+		if os.IsNotExist(readErr) {
+			return "", "", fmt.Errorf(
+				"no credentials found — set GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET, "+
+					"or place credentials.json in %s", config.AppDataDir())
 		}
-		// File does not exist — fall through to the error below.
-	} else {
-		var f credentialsFile
-		if err := json.Unmarshal(data, &f); err != nil {
-			return "", "", fmt.Errorf("failed to parse %s: %v", credPath, err)
-		}
-		if f.Installed.ClientID == "" || f.Installed.ClientSecret == "" {
-			return "", "", fmt.Errorf("%s is missing client_id or client_secret", credPath)
-		}
-		if clientID == "" {
-			clientID = f.Installed.ClientID
-		}
-		if clientSecret == "" {
-			clientSecret = f.Installed.ClientSecret
-		}
-		return clientID, clientSecret, nil
+		return "", "", fmt.Errorf("failed to read %s: %w", credPath, readErr)
 	}
 
-	return "", "", fmt.Errorf(
-		"no credentials found — set GMAIL_CLIENT_ID + GMAIL_CLIENT_SECRET, "+
-			"or place credentials.json in %s", config.AppDataDir(),
-	)
+	var f credentialsFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return "", "", fmt.Errorf("failed to parse %s: %w", credPath, err)
+	}
+	if f.Installed.ClientID == "" || f.Installed.ClientSecret == "" {
+		return "", "", fmt.Errorf("%s is missing client_id or client_secret", credPath)
+	}
+	return f.Installed.ClientID, f.Installed.ClientSecret, nil
 }
 
 // OAuthConfig returns an oauth2.Config for Gmail.
-// RedirectURL is intentionally left empty; GetToken sets it dynamically.
 func OAuthConfig(clientID, clientSecret string) *oauth2.Config {
 	return &oauth2.Config{
 		ClientID:     clientID,
@@ -80,112 +68,84 @@ func OAuthConfig(clientID, clientSecret string) *oauth2.Config {
 	}
 }
 
-// GetToken retrieves a cached token or starts the OAuth browser flow.
-func GetToken(cfg *oauth2.Config) (*oauth2.Token, error) {
-	tokenFile := config.AppFilePath("token.json")
-
-	token, err := tokenFromFile(tokenFile)
+// GetCachedToken loads a usable token from the cache file.
+// Returns ErrNoToken if no file exists or the token is expired with no refresh token.
+func GetCachedToken() (*oauth2.Token, error) {
+	token, err := tokenFromFile(config.AppFilePath("token.json"))
 	if err != nil {
-		log.Printf("No token found (%v), starting OAuth flow...", err)
-		return performOAuthFlow(cfg, tokenFile)
+		return nil, ErrNoToken
 	}
-
-	// If the access token is expired but we have a refresh token, the oauth2
-	// client will refresh it automatically — no need to re-run the full flow.
 	if token.RefreshToken == "" && !token.Valid() {
-		log.Println("Token expired and no refresh token — starting OAuth flow...")
-		return performOAuthFlow(cfg, tokenFile)
+		return nil, ErrNoToken
 	}
-
 	log.Println("✅ Using cached token")
 	return token, nil
 }
 
-func performOAuthFlow(cfg *oauth2.Config, tokenFile string) (*oauth2.Token, error) {
-	token, err := getTokenFromWeb(cfg)
-	if err != nil {
-		return nil, err
-	}
-	saveToken(tokenFile, token)
-	return token, nil
+// DeviceFlow tracks an in-progress Google Device Authorization Grant (RFC 8628).
+type DeviceFlow struct {
+	// VerificationURI is the URL the user should open. May have the code embedded.
+	VerificationURI string
+	// UserCode is the short code to enter at the verification page.
+	UserCode string
+
+	done  chan struct{}
+	token *oauth2.Token
+	err   error
 }
 
-func getTokenFromWeb(cfg *oauth2.Config) (*oauth2.Token, error) {
-	codeChan := make(chan string)
-	errChan := make(chan error, 1)
+// Wait returns a channel that is closed when the flow completes (success or error).
+func (df *DeviceFlow) Wait() <-chan struct{} { return df.done }
 
-	// Bind on :0 so the OS assigns a free port — avoids conflicts with the
-	// SSE server or any other process running on the same machine.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, fmt.Errorf("failed to start OAuth callback listener: %v", err)
+// IsComplete reports whether the flow has finished without blocking.
+func (df *DeviceFlow) IsComplete() bool {
+	select {
+	case <-df.done:
+		return true
+	default:
+		return false
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	cfg.RedirectURL = fmt.Sprintf("http://localhost:%d", port)
+}
 
-	mux := http.NewServeMux()
-	callbackServer := &http.Server{Handler: mux}
+// Token returns the authorized token. Only valid after Wait() is closed.
+func (df *DeviceFlow) Token() *oauth2.Token { return df.token }
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			errChan <- fmt.Errorf("no code in OAuth callback")
-			return
-		}
-		_, _ = fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Gmail MCP Server</title></head><body>
-<h1>Authorization successful!</h1>
-<p>You can close this window and return to your terminal.</p>
-</body></html>`)
-		codeChan <- code
-	})
+// Err returns any error from the flow. Only valid after Wait() is closed.
+func (df *DeviceFlow) Err() error { return df.err }
+
+// StartDeviceFlow begins a Google Device Authorization Grant.
+// It polls Google in the background; check IsComplete() or receive on Wait().
+func StartDeviceFlow(ctx context.Context, cfg *oauth2.Config) (*DeviceFlow, error) {
+	da, err := cfg.DeviceAuth(ctx, oauth2.AccessTypeOffline)
+	if err != nil {
+		return nil, fmt.Errorf("starting device authorization: %w", err)
+	}
+
+	uri := da.VerificationURIComplete
+	if uri == "" {
+		uri = da.VerificationURI
+	}
+
+	df := &DeviceFlow{
+		VerificationURI: uri,
+		UserCode:        da.UserCode,
+		done:            make(chan struct{}),
+	}
 
 	go func() {
-		if err := callbackServer.Serve(listener); err != nil && err != http.ErrServerClosed {
-			errChan <- fmt.Errorf("OAuth callback server error: %v", err)
+		defer close(df.done)
+		token, err := cfg.DeviceAccessToken(ctx, da)
+		if err != nil {
+			df.err = fmt.Errorf("device authorization: %w", err)
+			log.Printf("❌ Gmail device authorization failed: %v", err)
+			return
 		}
+		saveToken(config.AppFilePath("token.json"), token)
+		df.token = token
+		log.Println("✅ Gmail authorization complete — token saved")
 	}()
 
-	authURL := cfg.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Println("Opening browser for Gmail authorization...")
-	fmt.Printf("If the browser does not open automatically, visit:\n  %s\n", authURL)
-	openBrowser(authURL)
-
-	var authCode string
-	select {
-	case authCode = <-codeChan:
-	case err := <-errChan:
-		return nil, fmt.Errorf("authorization failed: %v", err)
-	case <-time.After(5 * time.Minute):
-		return nil, fmt.Errorf("authorization timed out after 5 minutes")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = callbackServer.Shutdown(ctx)
-
-	token, err := cfg.Exchange(context.Background(), authCode)
-	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve token: %v", err)
-	}
-	fmt.Println("✅ Authorization successful! Token saved.")
-	return token, nil
-}
-
-func openBrowser(url string) {
-	var err error
-	switch runtime.GOOS {
-	case "linux":
-		err = exec.Command("xdg-open", url).Start()
-	case "windows":
-		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-	case "darwin":
-		err = exec.Command("open", url).Start()
-	default:
-		err = fmt.Errorf("unsupported platform")
-	}
-	if err != nil {
-		fmt.Printf("Could not open browser automatically: %v\n", err)
-	}
+	return df, nil
 }
 
 func tokenFromFile(file string) (*oauth2.Token, error) {
@@ -194,10 +154,8 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-
 	token := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(token)
-	return token, err
+	return token, json.NewDecoder(f).Decode(token)
 }
 
 func saveToken(path string, token *oauth2.Token) {

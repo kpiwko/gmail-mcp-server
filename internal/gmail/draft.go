@@ -15,15 +15,20 @@ import (
 // map of threadID → draft summaries. Cost: 1 Drafts.List + 1 Drafts.Get per
 // draft (independent of the number of threads being processed).
 func (s *Server) fetchDraftsByThread() (map[string][]map[string]interface{}, error) {
+	svc, err := s.svc()
+	if err != nil {
+		return nil, err
+	}
+
 	result := make(map[string][]map[string]interface{})
 
-	draftsList, err := s.service.Users.Drafts.List(s.userID).Do()
+	draftsList, err := svc.Users.Drafts.List(s.userID).Do()
 	if err != nil {
 		return result, fmt.Errorf("failed to list drafts: %v", err)
 	}
 
 	for _, d := range draftsList.Drafts {
-		fullDraft, err := s.service.Users.Drafts.Get(s.userID, d.Id).Do()
+		fullDraft, err := svc.Users.Drafts.Get(s.userID, d.Id).Do()
 		if err != nil || fullDraft.Message == nil {
 			continue
 		}
@@ -68,6 +73,11 @@ func (s *Server) getThreadDrafts(threadID string) ([]map[string]interface{}, err
 
 // CreateDraft creates a Gmail draft or updates an existing draft in the thread.
 func (s *Server) CreateDraft(ctx context.Context, to, subject, body, threadID string) (*mcp.CallToolResult, error) {
+	svc, err := s.svc()
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	var message gmail.Message
 	headers := fmt.Sprintf("To: %s\r\n", to)
 
@@ -78,7 +88,7 @@ func (s *Server) CreateDraft(ctx context.Context, to, subject, body, threadID st
 			subject = "Re: " + subject
 		}
 
-		thread, err := s.service.Users.Threads.Get(s.userID, threadID).Do()
+		thread, err := svc.Users.Threads.Get(s.userID, threadID).Do()
 		if err == nil && len(thread.Messages) > 0 {
 			lastMessage := thread.Messages[len(thread.Messages)-1]
 			var messageID, references string
@@ -107,7 +117,7 @@ func (s *Server) CreateDraft(ctx context.Context, to, subject, body, threadID st
 			message.Raw = base64.URLEncoding.EncodeToString([]byte(headers + "\r\n" + body))
 
 			draft := &gmail.Draft{Id: existingDraftID, Message: &message}
-			updated, err := s.service.Users.Drafts.Update(s.userID, existingDraftID, draft).Do()
+			updated, err := svc.Users.Drafts.Update(s.userID, existingDraftID, draft).Do()
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("Failed to update existing draft: %v", err)), nil
 			}
@@ -128,7 +138,7 @@ func (s *Server) CreateDraft(ctx context.Context, to, subject, body, threadID st
 	message.Raw = base64.URLEncoding.EncodeToString([]byte(headers + "\r\n" + body))
 
 	draft := &gmail.Draft{Message: &message}
-	created, err := s.service.Users.Drafts.Create(s.userID, draft).Do()
+	created, err := svc.Users.Drafts.Create(s.userID, draft).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to create draft: %v", err)), nil
 	}

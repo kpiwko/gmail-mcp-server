@@ -77,7 +77,12 @@ func findAttachmentPart(parts []*gmail.MessagePart, attachmentID string, result 
 // ExtractAttachmentByFilename extracts text from an attachment identified by filename.
 // This is more reliable than using attachment IDs, which are unstable in Gmail API.
 func (s *Server) ExtractAttachmentByFilename(ctx context.Context, messageID, filename string) (*mcp.CallToolResult, error) {
-	message, err := s.service.Users.Messages.Get(s.userID, messageID).Do()
+	svc, err := s.svc()
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	message, err := svc.Users.Messages.Get(s.userID, messageID).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get message: %v", err)), nil
 	}
@@ -108,7 +113,7 @@ func (s *Server) ExtractAttachmentByFilename(ctx context.Context, messageID, fil
 	}
 
 	attachmentID := targetAttachment["attachmentId"].(string)
-	raw, err := s.service.Users.Messages.Attachments.Get(s.userID, messageID, attachmentID).Do()
+	raw, err := svc.Users.Messages.Attachments.Get(s.userID, messageID, attachmentID).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get attachment data: %v", err)), nil
 	}
@@ -137,7 +142,12 @@ func (s *Server) ExtractAttachmentByFilename(ctx context.Context, messageID, fil
 
 // ExtractAttachmentText extracts text from an attachment identified by ID.
 func (s *Server) ExtractAttachmentText(ctx context.Context, messageID, attachmentID string) (*mcp.CallToolResult, error) {
-	message, err := s.service.Users.Messages.Get(s.userID, messageID).Do()
+	svc, err := s.svc()
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	message, err := svc.Users.Messages.Get(s.userID, messageID).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get message: %v", err)), nil
 	}
@@ -156,7 +166,7 @@ func (s *Server) ExtractAttachmentText(ctx context.Context, messageID, attachmen
 			"Attachment not found. Available: %v", allAttachments)), nil
 	}
 
-	raw, err := s.service.Users.Messages.Attachments.Get(s.userID, messageID, attachmentID).Do()
+	raw, err := svc.Users.Messages.Attachments.Get(s.userID, messageID, attachmentID).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get attachment: %v", err)), nil
 	}

@@ -1,0 +1,12 @@
+.env
+*.env
+credentials.json
+token.json
+.webui_secret_key
+dist/
+bin/
+coverage.out
+coverage.html
+.claude/
+.idea/
+.vscode/

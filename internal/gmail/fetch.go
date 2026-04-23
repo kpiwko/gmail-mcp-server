@@ -18,9 +18,14 @@ const (
 // ~800 chars of the body plus key headers. Use this to identify which threads
 // actually need full content before calling FetchEmailBodies.
 func (s *Server) PreviewEmailBodies(ctx context.Context, threadIDs []string) (*mcp.CallToolResult, error) {
+	svc, err := s.svc()
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	results := make([]map[string]interface{}, 0, len(threadIDs))
 	for _, threadID := range threadIDs {
-		threadDetail, err := s.service.Users.Threads.Get(s.userID, threadID).Do()
+		threadDetail, err := svc.Users.Threads.Get(s.userID, threadID).Do()
 		if err != nil {
 			log.Printf("Warning: Failed to get thread %s: %v", threadID, err)
 			continue
@@ -83,6 +88,11 @@ func (s *Server) PreviewEmailBodies(ctx context.Context, threadIDs []string) (*m
 // FetchEmailBodies fetches full email content for the given thread IDs.
 // Drafts for all threads are fetched once up front to avoid N+1 API calls.
 func (s *Server) FetchEmailBodies(ctx context.Context, threadIDs []string) (*mcp.CallToolResult, error) {
+	svc, err := s.svc()
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	draftsByThread, err := s.fetchDraftsByThread()
 	if err != nil {
 		log.Printf("Warning: Failed to fetch drafts: %v", err)
@@ -91,7 +101,7 @@ func (s *Server) FetchEmailBodies(ctx context.Context, threadIDs []string) (*mcp
 
 	results := make([]map[string]interface{}, 0, len(threadIDs))
 	for _, threadID := range threadIDs {
-		threadDetail, err := s.service.Users.Threads.Get(s.userID, threadID).Do()
+		threadDetail, err := svc.Users.Threads.Get(s.userID, threadID).Do()
 		if err != nil {
 			log.Printf("Warning: Failed to get thread %s: %v", threadID, err)
 			continue
